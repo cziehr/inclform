@@ -48,20 +48,6 @@ function eval_form_php($arr) {
 class syntax_plugin_inclform extends DokuWiki_Syntax_Plugin {
  
     /**
-     * return some info
-     */
-    function getInfo(){
-        return array(
-            'author' => 'Kite',
-            'email'  => 'kite@puzzlers.org',
-            'date'   => '2006-09-02',
-            'name'   => 'Include Form',
-            'desc'   => 'Includes an approved form into a page.',
-            'url'    => 'http://www.dokuwiki.org/wiki:plugins:incl_form',
-        );
-    }
- 
-    /**
      * What kind of syntax are we?
      */
     function getType(){
