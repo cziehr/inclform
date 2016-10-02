@@ -1,5 +1,5 @@
 base inclform
-author Christoph Ziehr, Kite
+author cziehr, Kite
 email info@einsatzleiterwiki.de, kite@puzzlers.org
 date 2016-10-02
 name Include Form
