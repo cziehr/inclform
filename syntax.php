@@ -101,7 +101,7 @@ class syntax_plugin_inclform extends DokuWiki_Syntax_Plugin {
 	  if(empty($rev)){
 	    $id = cleanID($id);
 	    $id = str_replace(':','/',$id);
-	    $fn = $conf['formdir'].'/'.utf8_encodeFN($id).'.php';
+	    $fn = $this->getConf('formdir').'/'.utf8_encodeFN($id).'.php';
 	  }
 	  return $fn;
 	} // formFN()
