@@ -1,6 +1,6 @@
 base inclform
-author Christoph Ziehr
-email info@einsatzleiterwiki.de
+author Christoph Ziehr, Kite
+email info@einsatzleiterwiki.de, kite@puzzlers.org
 date 2016-10-02
 name Include Form
 desc Includes an approved form into a page. Can also be used to insert safely php into pages.
