@@ -1,6 +1,6 @@
 <?php
 /**
- * Options for the GOTO plugin
+ * Options for the INCLFORM plugin
  *
  * @author cziehr <info@einsatzleiterwiki.de>
  */
