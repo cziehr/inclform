@@ -124,7 +124,7 @@ class syntax_plugin_inclform extends DokuWiki_Syntax_Plugin {
 	}
         if(file_exists(DOKU_INC . $path)) {
 	    //echo "<!-- form was found -->\n";
-	    $text = io_readFile($path); 
+	    $text = io_readFile(DOKU_INC . $path); 
 	    $pattern = "/(<\?php)(.*?)(\?>)/is";			
 	    $text = eval_form_php($text);
 	} else {
