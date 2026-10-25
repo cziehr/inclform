@@ -1,8 +1,9 @@
 <?php
+
 /**
- * Options for the INCLFORM plugin
+ * Configuration metadata for the inclform plugin
  *
  * @author cziehr <info@einsatzleiterwiki.de>
  */
- 
- $meta['formdir'] = array('string');
+
+$meta['formdir'] = ['string'];

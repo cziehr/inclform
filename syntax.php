@@ -1,136 +1,341 @@
 <?php
+
 /**
- * Plugin Include Form: include external, approved PHP forms
- * Updated April 19, 2007 by Kite <Kite@puzzlers.org>
+ * DokuWiki Plugin inclform (Syntax Component)
  *
- * @license    GPL 2 (http://www.gnu.org/licenses/gpl.html)
- * @author     Kite <Kite@puzzlers.org>
- * @based_on   "externallink" plugin by Otto Vainio <plugins@valjakko.net>
+ * Includes an approved PHP form (or any other PHP snippet) from a trusted
+ * directory into a wiki page:
+ *
+ *     ~~INCLFORM~~                      include the form named like the current page
+ *     ~~INCLFORM=my:form~~              include the form "my:form"
+ *     ~~INCLFORM=my:form;a=1;b=two~~    ... and hand over the parameters a and b
+ *
+ * A wiki ID like "my:form" is mapped to "<formdir>/my/form.php".
+ *
+ * SECURITY MODEL
+ * --------------
+ * The included files are executed as PHP code. That is the whole purpose of
+ * this plugin, so the form directory MUST be writable by trusted people only
+ * and SHOULD NOT be reachable through the web server (the default
+ * "data/forms" is protected by the .htaccess shipped in "data/").
+ * Everything that is controlled by wiki editors (the form name and the
+ * parameters) is treated as untrusted input:
+ *
+ *  - the form name is reduced to a valid wiki ID and the resulting path is
+ *    verified to stay inside the form directory (no path traversal),
+ *  - parameter values are HTML-escaped before they are handed to the form,
+ *  - the output is never cached, because forms are dynamic by nature.
+ *
+ * History: based on the "incl_form" plugin by Kite, which in turn is based on
+ * the "externallink" plugin by Otto Vainio. Rewritten for current DokuWiki and
+ * PHP versions (no more eval(), no globals, no PHP warnings).
+ *
+ * @license GPL 2 (http://www.gnu.org/licenses/gpl.html)
+ * @author  Kite <Kite@puzzlers.org>
+ * @author  cziehr <info@einsatzleiterwiki.de>
  */
- 
-if(!defined('DOKU_INC')) {
-	define('DOKU_INC',realpath(dirname(__FILE__).'/../../').'/');
+
+use dokuwiki\Extension\SyntaxPlugin;
+use dokuwiki\Logger;
+
+// must be run within DokuWiki
+if (!defined('DOKU_INC')) {
+    die();
 }
-if(!defined('DOKU_PLUGIN')) {
-	define('DOKU_PLUGIN',DOKU_INC.'lib/plugins/');
-}
- 
-require_once(DOKU_PLUGIN.'syntax.php');
- 
- 
-function eval_form_php($arr) {
-	global $INFO;
- 
-	if(0 and ($INFO['perm'] == AUTH_ADMIN)) { // Use debug output??
-		ob_start();
-		$content = "<!-- Content: "; 
-		print_r( $arr ); 
-		$content .= ob_get_contents();
-		ob_end_clean();
-		$content .= " -->\n";
-		echo $content;  // can't return this
-	}
-	ob_start();
-	if($INFO['perm'] == AUTH_ADMIN) {
-		eval("?>$arr");              //  not $arr -- now allows parsing all PHP blocks 
-	} else {
-		@eval("?>$arr");             //  not $arr -- now allows parsing all PHP blocks 
-	}	
-	$content = ob_get_contents();
-	ob_end_clean();
-	return $content;
-}
- 
-/**
- * All DokuWiki plugins to extend the parser/rendering mechanism
- * need to inherit from this class
- */
-class syntax_plugin_inclform extends DokuWiki_Syntax_Plugin {
- 
+
+class syntax_plugin_inclform extends SyntaxPlugin
+{
     /**
-     * What kind of syntax are we?
+     * Syntax type.
+     *
+     * NOTE: 'substition' is NOT a typo of ours. It is the (misspelled) name
+     * DokuWiki itself uses for this syntax type, so it has to stay as is.
+     *
+     * @return string
      */
-    function getType(){
+    public function getType()
+    {
         return 'substition';
     }
- 
-    // Just before build in links
-    function getSort(){ return 299; }
- 
+
     /**
-     * What about paragraphs?
+     * Sort order. 299 places us just before the built-in link handling (300).
+     *
+     * @return int
      */
-    function getPType(){
+    public function getSort()
+    {
+        return 299;
+    }
+
+    /**
+     * Paragraph type. A form is rendered as a block element, therefore
+     * DokuWiki must not wrap it into a <p> element.
+     *
+     * @return string
+     */
+    public function getPType()
+    {
         return 'block';
     }
- 
-    function connectTo($mode) {
-       $this->Lexer->addSpecialPattern('~~INCLFORM[^~]*~~',$mode,'plugin_inclform');
-    }
- 
- 
+
     /**
-     * Handle the match
+     * Register the syntax pattern with the lexer.
+     *
+     * The tag is either "~~INCLFORM~~" or "~~INCLFORM=<specification>~~".
+     * The specification cannot contain a tilde (that would end the tag).
+     * Only a non-capturing group may be used here, the lexer does not
+     * support capturing groups in patterns.
+     *
+     * @param string $mode Parser mode
      */
-    function handle($match, $state, $pos, Doku_Handler $handler){
-	    // Remove the tag itself, and then separate the form name
-	    // from the parameter set.
-	    $match = preg_replace("%~~INCLFORM(=(.*))?~~%u", "\\2", $match);
-	    //echo "\n\t<!-- syntax_plugin_INCLFORM.handle() found >> $match << -->\n";
-        return $match;
+    public function connectTo($mode)
+    {
+        $this->Lexer->addSpecialPattern('~~INCLFORM(?:=[^~]*)?~~', $mode, 'plugin_inclform');
     }
- 
+
     /**
-     * Create output
+     * Parse the matched tag into a form ID and a parameter list.
+     *
+     * This runs once per page change; the result is stored in DokuWiki's
+     * instruction cache. Therefore it must not depend on anything but the
+     * matched text.
+     *
+     * Specification syntax: "<form>;<key>=<value>;<key>=<value>..."
+     *  - the form name is optional, an empty name means "the current page"
+     *  - a parameter without "=" is accepted and gets an empty value
+     *  - only the first "=" separates key and value, so values may contain "="
+     *  - parameters without a key are ignored (e.g. caused by ";;")
+     *
+     * @param string       $match   The text matched by the pattern
+     * @param int          $state   The lexer state
+     * @param int          $pos     Byte position of the match in the page
+     * @param Doku_Handler $handler The handler
+     * @return array{form: string, params: array<string,string>}
      */
-    function render($mode, Doku_Renderer $renderer, $data) {
-        if($mode == 'xhtml'){
-	    $FORM_PARAMS = explode(';', $data);
-            $text=$this->_inc_form($FORM_PARAMS[0], $FORM_PARAMS);
-            $renderer->doc .= $text;
-            return true;
+    public function handle($match, $state, $pos, Doku_Handler $handler)
+    {
+        // strip the leading "~~INCLFORM" and the trailing "~~"
+        $spec = substr($match, strlen('~~INCLFORM'), -2);
+        // what remains is either empty or "=<specification>"
+        $spec = (string)substr($spec, 1);
+
+        $items = explode(';', $spec);
+
+        // The first item is the form name. Turn it into a valid wiki ID right
+        // away: this removes anything that could be abused in a file path.
+        $form = cleanID((string)array_shift($items));
+
+        $params = [];
+        foreach ($items as $item) {
+            // limit 2: everything after the first "=" belongs to the value
+            $parts = explode('=', $item, 2);
+            $key = trim($parts[0]);
+            if ($key === '') {
+                continue;
+            }
+            $params[$key] = isset($parts[1]) ? $parts[1] : '';
         }
-        return false;
+
+        return ['form' => $form, 'params' => $params];
     }
- 
- 
-	//Translate an ID into a form file name
-	//path is relative to the DokuWiki root (I use data/forms)
-	function formFN($id,$rev=''){
-	  global $conf;
-	  if(empty($rev)){
-	    $id = cleanID($id);
-	    $id = str_replace(':','/',$id);
-	    $fn = $this->getConf('formdir').'/'.utf8_encodeFN($id).'.php';
-	  }
-	  return $fn;
-	} // formFN()
- 
-    function _inc_form($form, $PARAMS) {
-	global $FORM_PARAMS;
-	global $ID;
-        if(strlen($form) < 1) {
-	    $form = $ID;   // default to the current page ID
-	}
-        // Break the form parameters (if any) into name/values
-	$path =  $this->formFN($form);  
-	foreach($PARAMS as $item) {
-	    // split the pair
-	    $parts = explode('=', $item);
-	    // Skip the $ID parameter
-	    if(strlen($parts[0])>0) {
-		$FORM_PARAMS[$parts[0]] = $parts[1];  
-	    }
-	}
-        if(file_exists(DOKU_INC . $path)) {
-	    //echo "<!-- form was found -->\n";
-	    $text = io_readFile(DOKU_INC . $path); 
-	    $pattern = "/(<\?php)(.*?)(\?>)/is";			
-	    $text = eval_form_php($text);
-	} else {
-	    $text = "\n\t<!-- No form found for '$form'-->\n";
-	}
-	return $text;
-    } // _inc_form()
-} // syntax_plugin_INCLFORM
-?>
+
+    /**
+     * Render the included form.
+     *
+     * Only the XHTML output is supported. Other formats (metadata, plain
+     * text export, ...) intentionally get nothing, because running arbitrary
+     * form code outside of a normal page view makes no sense.
+     *
+     * @param string        $format   Renderer format
+     * @param Doku_Renderer $renderer The renderer
+     * @param array         $data     The data returned by handle()
+     * @return bool true if the format was handled
+     */
+    public function render($format, Doku_Renderer $renderer, $data)
+    {
+        if ($format !== 'xhtml') {
+            return false;
+        }
+
+        // Forms are dynamic (session data, tokens, current time, ...). If
+        // their output ended up in DokuWiki's page cache, it would be served
+        // to other users and other requests. So never cache pages using us.
+        $renderer->nocache();
+
+        $renderer->doc .= $this->includeForm($data['form'], $data['params']);
+        return true;
+    }
+
+    /**
+     * Locate, run and return the output of a form.
+     *
+     * Errors never break the page: a missing form or an exception inside a
+     * form results in empty output. Administrators additionally get a
+     * message, everybody else must not learn about server internals.
+     *
+     * @param string               $form   Cleaned form ID, empty for the current page
+     * @param array<string,string> $params Raw parameters from the wiki page
+     * @return string The HTML produced by the form
+     */
+    protected function includeForm($form, array $params)
+    {
+        global $ID;
+
+        if ($form === '') {
+            // default: the form that belongs to the current page
+            $form = cleanID((string)$ID);
+        }
+
+        $file = $this->resolveFormFile($form);
+        if ($file === null) {
+            $this->reportProblem(sprintf($this->getLang('err_not_found'), hsc($form)));
+            return '';
+        }
+
+        try {
+            return $this->runForm($file, $params);
+        } catch (\Throwable $e) {
+            // \Throwable also catches PHP engine errors (TypeError, ParseError, ...)
+            Logger::error(
+                'inclform: form "' . $form . '" failed: ' . $e->getMessage(),
+                (string)$e,
+                $e->getFile(),
+                $e->getLine()
+            );
+            $this->reportProblem(sprintf($this->getLang('err_failed'), hsc($form), hsc($e->getMessage())));
+            return '';
+        }
+    }
+
+    /**
+     * Execute a form file and capture its output.
+     *
+     * The file is loaded with a plain include inside a static closure.
+     * Compared to the former eval() this has several advantages:
+     *  - the file is seen by the PHP engine as a real file: correct file names
+     *    and line numbers in errors, OPcache and static analysis work,
+     *  - the form runs in its own variable scope. It cannot see (and
+     *    accidentally change) our local variables, and because the closure is
+     *    static there is no $this either,
+     *  - parameters are passed explicitly instead of through a global variable,
+     *    so several forms on one page cannot influence each other.
+     *
+     * Variables available to the form:
+     *  - $FORM_PARAMS     parameters from the wiki page, HTML-escaped (safe to print)
+     *  - $FORM_PARAMS_RAW the same parameters unmodified. Escape them yourself
+     *                     before printing and never use them in file paths,
+     *                     shell commands or SQL without proper validation.
+     * DokuWiki globals ($ID, $INFO, $conf, ...) are available with the usual
+     * "global" statement.
+     *
+     * @param string               $file   Absolute path, already verified by resolveFormFile()
+     * @param array<string,string> $params Raw parameters
+     * @return string
+     * @throws \Throwable whatever the form throws
+     */
+    protected function runForm($file, array $params)
+    {
+        $run = static function ($__inclformFile, $FORM_PARAMS, $FORM_PARAMS_RAW) {
+            $level = ob_get_level();
+            ob_start();
+            try {
+                include $__inclformFile;
+                return (string)ob_get_clean();
+            } catch (\Throwable $e) {
+                // Drop everything the form (and anything it opened) buffered,
+                // otherwise a half-finished form would leak into the page and
+                // the output buffer stack would be left unbalanced.
+                while (ob_get_level() > $level) {
+                    ob_end_clean();
+                }
+                throw $e;
+            }
+        };
+
+        return $run($file, array_map('hsc', $params), $params);
+    }
+
+    /**
+     * Map a form ID to a file and make sure it is safe to execute.
+     *
+     * The ID "a:b:c" becomes "<formdir>/a/b/c.php". Even though the ID has
+     * been cleaned already, the final path is resolved (symlinks and ".."
+     * included) and must be located inside the form directory. This is the
+     * actual protection against path traversal; the cleaning is only the first
+     * line of defense.
+     *
+     * @param string $id Cleaned form ID
+     * @return string|null Absolute path of the form file or null if there is none
+     */
+    protected function resolveFormFile($id)
+    {
+        $base = $this->getFormDirectory();
+        if ($base === null || $id === '') {
+            return null;
+        }
+
+        // ID -> relative path. utf8_encodeFN() applies the file name encoding
+        // configured in DokuWiki ('fnencode'), just like for page files.
+        $relative = utf8_encodeFN(str_replace(':', '/', $id));
+
+        $file = realpath($base . '/' . $relative . '.php');
+        if ($file === false || !is_file($file)) {
+            return null;
+        }
+
+        // the resolved file must live below the form directory
+        $prefix = rtrim($base, '/\\') . DIRECTORY_SEPARATOR;
+        if (DIRECTORY_SEPARATOR === '\\') {
+            // Windows file names are case insensitive
+            $inside = stripos($file, $prefix) === 0;
+        } else {
+            $inside = strpos($file, $prefix) === 0;
+        }
+
+        return $inside ? $file : null;
+    }
+
+    /**
+     * Get the resolved, absolute path of the configured form directory.
+     *
+     * The "formdir" option is relative to the DokuWiki root (this was the only
+     * supported form in earlier versions). Absolute paths are accepted as well,
+     * so the forms can be stored outside of the DokuWiki directory.
+     *
+     * @return string|null null if the directory is not configured or does not exist
+     */
+    protected function getFormDirectory()
+    {
+        $dir = trim((string)$this->getConf('formdir'));
+        if ($dir === '') {
+            return null;
+        }
+
+        // absolute: "/srv/forms", "\forms", "C:\forms", "C:/forms"
+        if (!preg_match('#^([a-zA-Z]:)?[/\\\\]#', $dir)) {
+            $dir = DOKU_INC . $dir;
+        }
+
+        $real = realpath($dir);
+        return ($real !== false && is_dir($real)) ? $real : null;
+    }
+
+    /**
+     * Tell the administrator that something went wrong.
+     *
+     * Regular visitors see nothing at all. (A page that is allowed to show
+     * error details to everybody would hand out file names and PHP messages to
+     * anonymous users.)
+     *
+     * @param string $message Already HTML-escaped message
+     */
+    protected function reportProblem($message)
+    {
+        global $INFO;
+
+        if (!empty($INFO['isadmin'])) {
+            msg('inclform: ' . $message, -1);
+        }
+    }
+}
